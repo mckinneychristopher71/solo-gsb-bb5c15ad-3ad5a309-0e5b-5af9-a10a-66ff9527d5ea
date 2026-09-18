@@ -1,0 +1,17 @@
+{
+  "from_version": "2026-09-17",
+  "to_version": "2026-09-18",
+  "flags": ["new_checkout", "dark_mode"],
+  "subjects": [
+    {
+      "subject_id": "s-ada",
+      "user_id": "user-1",
+      "attributes": { "email": "ada@acme.com", "tier": "silver", "theme": "auto" }
+    },
+    {
+      "subject_id": "s-bob",
+      "user_id": "user-2",
+      "attributes": { "email": "bob@example.com", "tier": "free", "theme": "light" }
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "version": "2026-09-20",
+  "flags": ["concierge_support", "new_dashboard"],
+  "user_id": "user-9",
+  "attributes": {
+    "email": "ada@acme.com",
+    "tier": "gold",
+    "age": 34,
+    "region": "us",
+    "beta_opt_in": true
+  }
+}

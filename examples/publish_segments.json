@@ -1,0 +1,55 @@
+{
+  "version": "2026-09-20",
+  "segments": {
+    "acme-staff": {
+      "conditions": [
+        { "attr": "email", "op": "suffix", "value": "@acme.com" }
+      ]
+    },
+    "valuable-users": {
+      "conditions": [
+        { "attr": "tier", "op": "in", "value": ["gold", "platinum"] },
+        { "attr": "age", "op": "ge", "value": 18 }
+      ]
+    },
+    "vip": {
+      "conditions": [
+        { "op": "segment", "value": "valuable-users" },
+        { "attr": "region", "op": "ne", "value": "eu" }
+      ]
+    }
+  },
+  "flags": {
+    "concierge_support": {
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "staff-always",
+          "conditions": [{ "op": "segment", "value": "acme-staff" }],
+          "value": true
+        },
+        {
+          "id": "vip-users",
+          "conditions": [{ "op": "segment", "value": "vip" }],
+          "value": true
+        }
+      ]
+    },
+    "new_dashboard": {
+      "enabled": true,
+      "default": false,
+      "rules": [
+        {
+          "id": "vip-beta",
+          "conditions": [
+            { "op": "segment", "value": "vip" },
+            { "attr": "beta_opt_in", "op": "eq", "value": true }
+          ],
+          "value": true
+        }
+      ],
+      "rollout": { "percentage": 10, "key": "user_id", "value": true }
+    }
+  }
+}

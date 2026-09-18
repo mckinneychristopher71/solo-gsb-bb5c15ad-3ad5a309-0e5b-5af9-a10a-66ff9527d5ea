@@ -1,0 +1,22 @@
+{
+  "version": "bad-segment-cycle",
+  "segments": {
+    "engaged": {
+      "conditions": [{ "op": "segment", "value": "vip" }]
+    },
+    "vip": {
+      "conditions": [{ "op": "segment", "value": "engaged" }]
+    }
+  },
+  "flags": {
+    "f": {
+      "rules": [
+        {
+          "id": "vip-rule",
+          "conditions": [{ "op": "segment", "value": "vip" }],
+          "value": true
+        }
+      ]
+    }
+  }
+}

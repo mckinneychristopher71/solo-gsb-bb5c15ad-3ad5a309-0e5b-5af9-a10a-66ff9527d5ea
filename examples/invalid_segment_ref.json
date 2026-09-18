@@ -1,0 +1,19 @@
+{
+  "version": "bad-segment-ref",
+  "segments": {
+    "vip": {
+      "conditions": [{ "op": "segment", "value": "valuable-users" }]
+    }
+  },
+  "flags": {
+    "f": {
+      "rules": [
+        {
+          "id": "vip-rule",
+          "conditions": [{ "op": "segment", "value": "vip" }],
+          "value": true
+        }
+      ]
+    }
+  }
+}
