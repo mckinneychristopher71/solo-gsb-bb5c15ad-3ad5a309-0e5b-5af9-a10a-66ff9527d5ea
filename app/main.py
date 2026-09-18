@@ -16,6 +16,9 @@ from .comparison import compare_versions
 from .evaluator import FlagEvaluator, FlagNotFound
 from .preview import build_evaluation_preview
 from .schemas import (
+    ApprovalCreateRequest,
+    ApprovalResponse,
+    ApprovalVoteRequest,
     BatchEvalRequest,
     BatchEvalResponse,
     ConfigComparisonRequest,
@@ -495,6 +498,227 @@ def evaluate_environment(name: str, body: EnvironmentEvalRequest) -> Any:
     )
 
 
+# ---------------------------------------------------------------------------
+# Environment change approvals
+# ---------------------------------------------------------------------------
+
+
+def _approval_http_error(exc: Exception) -> HTTPException:
+    """Map an approval-domain error onto the uniform error envelope."""
+    if isinstance(exc, db_mod.ApprovalNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={
+                "code": "approval_not_found",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, db_mod.EnvironmentNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={
+                "code": "environment_not_found",
+                "message": f"environment {exc.name!r} not found",
+            },
+        )
+    if isinstance(exc, db_mod.VersionNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={
+                "code": "version_not_found",
+                "message": f"config version {exc.version!r} not found",
+            },
+        )
+    if isinstance(exc, db_mod.ApprovalStale):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "approval_stale",
+                "message": str(exc),
+                "base_revision": exc.base_revision,
+                "current_revision": exc.current_revision,
+            },
+        )
+    if isinstance(exc, db_mod.TargetMatchesPointer):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "target_matches_pointer",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, db_mod.ApprovalNotPending):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "approval_not_pending",
+                "message": str(exc),
+                "status": exc.status,
+            },
+        )
+    if isinstance(exc, db_mod.ApplicantCannotApprove):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "applicant_cannot_approve",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, db_mod.ApproverAlreadyVoted):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "already_voted",
+                "message": str(exc),
+            },
+        )
+    if isinstance(exc, db_mod.InsufficientApprovals):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "insufficient_approvals",
+                "message": str(exc),
+                "votes": exc.votes,
+                "required_approvals": exc.required,
+            },
+        )
+    # Should be unreachable: callers only pass approval-domain exceptions.
+    raise exc
+
+
+@app.post(
+    "/api/v1/environments/{name}/approvals",
+    response_model=ApprovalResponse,
+    status_code=201,
+)
+def create_environment_approval(
+    name: str, body: ApprovalCreateRequest
+) -> Any:
+    conn = db_mod.connect()
+    try:
+        try:
+            approval = db_mod.create_approval(
+                conn,
+                name,
+                body.target_version,
+                body.applicant,
+                body.required_approvals,
+            )
+        except (
+            db_mod.EnvironmentNotFound,
+            db_mod.VersionNotFound,
+            db_mod.TargetMatchesPointer,
+        ) as exc:
+            raise _approval_http_error(exc)
+        return ApprovalResponse(**approval)
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/api/v1/environments/{name}/approvals/{approval_id}/votes",
+    response_model=ApprovalResponse,
+)
+def vote_environment_approval(
+    name: str, approval_id: int, body: ApprovalVoteRequest
+) -> Any:
+    conn = db_mod.connect()
+    try:
+        # Scope the id to the path's environment before accepting a vote, so
+        # a cross-environment id cannot gain a vote through this path.
+        existing = db_mod.get_approval(conn, approval_id)
+        if existing is None or existing["environment"] != name:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "approval_not_found",
+                    "message": (
+                        f"approval {approval_id} not found for environment"
+                        f" {name!r}"
+                    ),
+                },
+            )
+        try:
+            approval = db_mod.vote_approval(conn, approval_id, body.approver)
+        except (
+            db_mod.ApprovalNotFound,
+            db_mod.ApprovalNotPending,
+            db_mod.ApplicantCannotApprove,
+            db_mod.ApproverAlreadyVoted,
+        ) as exc:
+            raise _approval_http_error(exc)
+        return ApprovalResponse(**approval)
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/api/v1/environments/{name}/approvals/{approval_id}/execute",
+    response_model=ApprovalResponse,
+)
+def execute_environment_approval(name: str, approval_id: int) -> Any:
+    conn = db_mod.connect()
+    try:
+        # Scope the id to the path's environment before executing, so a
+        # cross-environment id cannot move a pointer through this path.
+        existing = db_mod.get_approval(conn, approval_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "approval_not_found",
+                    "message": f"approval {approval_id} not found",
+                },
+            )
+        if existing["environment"] != name:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "approval_not_found",
+                    "message": (
+                        f"approval {approval_id} not found for environment"
+                        f" {name!r}"
+                    ),
+                },
+            )
+        try:
+            approval = db_mod.execute_approval(conn, approval_id)
+        except (
+            db_mod.ApprovalNotFound,
+            db_mod.ApprovalNotPending,
+            db_mod.InsufficientApprovals,
+            db_mod.ApprovalStale,
+        ) as exc:
+            raise _approval_http_error(exc)
+        return ApprovalResponse(**approval)
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/api/v1/environments/{name}/approvals/{approval_id}",
+    response_model=ApprovalResponse,
+)
+def get_environment_approval(name: str, approval_id: int) -> Any:
+    conn = db_mod.connect()
+    try:
+        approval = db_mod.get_approval(conn, approval_id)
+        if approval is None or approval["environment"] != name:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "approval_not_found",
+                    "message": (
+                        f"approval {approval_id} not found for environment"
+                        f" {name!r}"
+                    ),
+                },
+            )
+        return ApprovalResponse(**approval)
+    finally:
+        conn.close()
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -511,6 +735,10 @@ def root() -> dict[str, Any]:
             "GET /api/v1/environments/{name}",
             "GET /api/v1/environments/{name}/history",
             "POST /api/v1/environments/{name}/evaluate",
+            "POST /api/v1/environments/{name}/approvals",
+            "GET /api/v1/environments/{name}/approvals/{approval_id}",
+            "POST /api/v1/environments/{name}/approvals/{approval_id}/votes",
+            "POST /api/v1/environments/{name}/approvals/{approval_id}/execute",
             "POST /api/v1/evaluate",
         ],
     }

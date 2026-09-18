@@ -343,5 +343,304 @@ class EnvironmentHistoryApiTests(unittest.TestCase):
             self.assertEqual(response.json()["error"]["code"], "invalid_request")
 
 
+@unittest.skipIf(TestClient is None, "fastapi/httpx not installed")
+class EnvironmentApprovalApiTests(unittest.TestCase):
+    """End-to-end approval lifecycle over HTTP."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        os.environ["FLAG_DB_PATH"] = self.db_path
+        self.client_cm = TestClient(app)
+        self.client = self.client_cm.__enter__()
+
+        for version in ("v1", "v2", "v3"):
+            self.assertEqual(
+                self.client.post(
+                    "/api/v1/configs",
+                    json={
+                        "version": version,
+                        "flags": {"f": {"enabled": True, "default": version}},
+                    },
+                ).status_code,
+                201,
+            )
+        self.assertEqual(
+            self.client.put(
+                "/api/v1/environments/prod",
+                json={"version": "v1", "expected_revision": 0},
+            ).status_code,
+            201,
+        )
+
+    def tearDown(self):
+        self.client_cm.__exit__(None, None, None)
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def _create(self, env="prod", **overrides):
+        """POST an approval; returns (response, id). ``id`` is None unless 201."""
+        payload = {
+            "target_version": "v2",
+            "applicant": "alice",
+            "required_approvals": 2,
+        }
+        payload.update(overrides)
+        response = self.client.post(
+            f"/api/v1/environments/{env}/approvals", json=payload
+        )
+        approval_id = response.json()["id"] if response.status_code == 201 else None
+        return response, approval_id
+
+    def test_full_happy_path_create_vote_execute_detail(self):
+        created, approval_id = self._create()
+        self.assertEqual(created.status_code, 201, created.text)
+        approval = created.json()
+        self.assertEqual(approval["environment"], "prod")
+        self.assertEqual(approval["target_version"], "v2")
+        self.assertEqual(approval["base_revision"], 1)
+        self.assertEqual(approval["applicant"], "alice")
+        self.assertEqual(approval["required_approvals"], 2)
+        self.assertEqual(approval["status"], "pending")
+        self.assertEqual(approval["vote_count"], 0)
+        self.assertEqual(approval["remaining_approvals"], 2)
+        self.assertEqual(approval["votes"], [])
+        self.assertIsNone(approval["executed_at"])
+
+        # One vote is not enough at threshold 2.
+        vote = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "bob"},
+        )
+        self.assertEqual(vote.status_code, 200, vote.text)
+        self.assertEqual(vote.json()["vote_count"], 1)
+        self.assertEqual(vote.json()["remaining_approvals"], 1)
+
+        execute_early = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/execute"
+        )
+        self.assertEqual(execute_early.status_code, 409)
+        self.assertEqual(
+            execute_early.json()["error"]["code"], "insufficient_approvals"
+        )
+        self.assertEqual(execute_early.json()["error"]["votes"], 1)
+        self.assertEqual(
+            execute_early.json()["error"]["required_approvals"], 2
+        )
+
+        second = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "carol"},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+
+        executed = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/execute"
+        )
+        self.assertEqual(executed.status_code, 200, executed.text)
+        body = executed.json()
+        self.assertEqual(body["status"], "executed")
+        self.assertIsNotNone(body["executed_at"])
+        self.assertEqual(body["vote_count"], 2)
+        self.assertEqual(
+            [v["approver"] for v in body["votes"]], ["bob", "carol"]
+        )
+
+        # The pointer moved and the existing history was appended to.
+        env = self.client.get("/api/v1/environments/prod").json()
+        self.assertEqual(env["version"], "v2")
+        self.assertEqual(env["revision"], 2)
+        history = self.client.get(
+            "/api/v1/environments/prod/history"
+        ).json()["history"]
+        self.assertEqual(
+            [(h["revision"], h["version"], h["operation"]) for h in history],
+            [(1, "v1", "create"), (2, "v2", "update")],
+        )
+
+        detail = self.client.get(
+            f"/api/v1/environments/prod/approvals/{approval_id}"
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["status"], "executed")
+
+    def test_create_errors_404_environment_404_version_409_same_pointer(self):
+        missing_env, _ = self._create(env="ghost")
+        self.assertEqual(missing_env.status_code, 404)
+        self.assertEqual(missing_env.json()["error"]["code"], "environment_not_found")
+
+        missing_version, _ = self._create(target_version="ghost")
+        self.assertEqual(missing_version.status_code, 404)
+        self.assertEqual(missing_version.json()["error"]["code"], "version_not_found")
+
+        same, _ = self._create(target_version="v1")
+        self.assertEqual(same.status_code, 409)
+        self.assertEqual(same.json()["error"]["code"], "target_matches_pointer")
+
+    def test_request_body_validation_is_422_envelope(self):
+        # required_approvals outside 1..5, empty fields, unknown fields.
+        for payload in (
+            {"target_version": "v2", "applicant": "a", "required_approvals": 0},
+            {"target_version": "v2", "applicant": "a", "required_approvals": 6},
+            {"target_version": "", "applicant": "a", "required_approvals": 1},
+            {"target_version": "v2", "applicant": "", "required_approvals": 1},
+            {
+                "target_version": "v2",
+                "applicant": "a",
+                "required_approvals": 1,
+                "unexpected": True,
+            },
+        ):
+            response = self.client.post(
+                "/api/v1/environments/prod/approvals", json=payload
+            )
+            self.assertEqual(response.status_code, 422, payload)
+            self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
+        bad_vote = self.client.post(
+            "/api/v1/environments/prod/approvals/1/votes", json={"approver": ""}
+        )
+        self.assertEqual(bad_vote.status_code, 422)
+        self.assertEqual(bad_vote.json()["error"]["code"], "invalid_request")
+
+    def test_applicant_self_approval_is_409(self):
+        _, approval_id = self._create()
+        response = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "alice"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "applicant_cannot_approve")
+
+    def test_duplicate_vote_is_409(self):
+        _, approval_id = self._create(required_approvals=1)
+        first = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "bob"},
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "bob"},
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json()["error"]["code"], "already_voted")
+
+    def test_stale_execution_marks_stale_and_keeps_pointer(self):
+        _, approval_id = self._create(target_version="v2", required_approvals=1)
+        # A direct pointer move lands first, burning the revision.
+        moved = self.client.put(
+            "/api/v1/environments/prod",
+            json={"version": "v2", "expected_revision": 1},
+        )
+        self.assertEqual(moved.status_code, 200)
+        self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "bob"},
+        )
+        execute = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/execute"
+        )
+        self.assertEqual(execute.status_code, 409)
+        body = execute.json()["error"]
+        self.assertEqual(body["code"], "approval_stale")
+        self.assertEqual(body["base_revision"], 1)
+        self.assertEqual(body["current_revision"], 2)
+
+        detail = self.client.get(
+            f"/api/v1/environments/prod/approvals/{approval_id}"
+        ).json()
+        self.assertEqual(detail["status"], "stale")
+        self.assertIsNotNone(detail["executed_at"])
+        # Pointer exactly where the direct PUT left it, history untouched.
+        env = self.client.get("/api/v1/environments/prod").json()
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+        history = self.client.get(
+            "/api/v1/environments/prod/history"
+        ).json()["history"]
+        self.assertEqual(len(history), 2)
+
+        # Terminal status: further votes/executes are rejected.
+        vote = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "zoe"},
+        )
+        self.assertEqual(vote.status_code, 409)
+        self.assertEqual(vote.json()["error"]["code"], "approval_not_pending")
+        again = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/execute"
+        )
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(again.json()["error"]["code"], "approval_not_pending")
+
+    def test_executed_approval_rejects_further_votes_and_execution(self):
+        _, approval_id = self._create(required_approvals=1)
+        self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "bob"},
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/v1/environments/prod/approvals/{approval_id}/execute"
+            ).status_code,
+            200,
+        )
+        vote = self.client.post(
+            f"/api/v1/environments/prod/approvals/{approval_id}/votes",
+            json={"approver": "zoe"},
+        )
+        self.assertEqual(vote.status_code, 409)
+        self.assertEqual(vote.json()["error"]["code"], "approval_not_pending")
+
+    def test_unknown_approval_returns_404(self):
+        cases = [
+            ("get", "", None),
+            ("post", "/votes", {"approver": "bob"}),
+            ("post", "/execute", None),
+        ]
+        for method, suffix, payload in cases:
+            kwargs = {"json": payload} if payload is not None else {}
+            response = getattr(self.client, method)(
+                "/api/v1/environments/prod/approvals/999" + suffix, **kwargs
+            )
+            self.assertEqual(response.status_code, 404, suffix)
+            self.assertEqual(
+                response.json()["error"]["code"], "approval_not_found", suffix
+            )
+
+    def test_approval_scoped_to_its_own_environment(self):
+        # Create an approval on staging (after creating that environment).
+        self.assertEqual(
+            self.client.put(
+                "/api/v1/environments/staging",
+                json={"version": "v1", "expected_revision": 0},
+            ).status_code,
+            201,
+        )
+        _, staging_id = self._create(env="staging", target_version="v2")
+        # The prod path must not see or operate on staging's approval.
+        self.assertEqual(
+            self.client.get(
+                f"/api/v1/environments/prod/approvals/{staging_id}"
+            ).status_code,
+            404,
+        )
+        vote = self.client.post(
+            f"/api/v1/environments/prod/approvals/{staging_id}/votes",
+            json={"approver": "bob"},
+        )
+        self.assertEqual(vote.status_code, 404)
+        execute = self.client.post(
+            f"/api/v1/environments/prod/approvals/{staging_id}/execute"
+        )
+        self.assertEqual(execute.status_code, 404)
+        # The cross-path attempts did not register a vote.
+        detail = self.client.get(
+            f"/api/v1/environments/staging/approvals/{staging_id}"
+        ).json()
+        self.assertEqual(detail["vote_count"], 0)
+        self.assertEqual(detail["status"], "pending")
+
+
 if __name__ == "__main__":
     unittest.main()

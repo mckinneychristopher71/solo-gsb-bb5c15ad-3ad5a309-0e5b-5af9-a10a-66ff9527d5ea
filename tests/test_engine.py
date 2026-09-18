@@ -1413,5 +1413,284 @@ class EnvironmentHistoryTests(unittest.TestCase):
         self.assertEqual(history[-1]["version"], "v2")
 
 
+class EnvironmentApprovalTests(unittest.TestCase):
+    """Gated pointer moves: create / vote / execute / stale lifecycle."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FLAG_DB_PATH"] = os.path.join(self.tmp.name, "test.db")
+        self.conn = db_mod.connect()
+        db_mod.init_db(self.conn)
+        for version in ("v1", "v2", "v3"):
+            db_mod.insert_version(
+                self.conn,
+                version,
+                {"flags": {"f": {"enabled": True, "default": version, "rules": []}}},
+            )
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+        # A second environment already sitting on v2.
+        db_mod.upsert_environment(self.conn, "staging", "v2", 0)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def _open(self, env="prod", target="v2", applicant="alice", required=2):
+        return db_mod.create_approval(
+            self.conn, env, target, applicant, required
+        )
+
+    def test_create_records_environment_target_base_and_applicant(self):
+        approval = self._open(required=3)
+        self.assertEqual(approval["status"], db_mod.APPROVAL_PENDING)
+        self.assertEqual(approval["environment"], "prod")
+        self.assertEqual(approval["target_version"], "v2")
+        self.assertEqual(approval["base_revision"], 1)
+        self.assertEqual(approval["applicant"], "alice")
+        self.assertEqual(approval["required_approvals"], 3)
+        self.assertEqual(approval["votes"], [])
+        self.assertEqual(approval["vote_count"], 0)
+        self.assertEqual(approval["remaining_approvals"], 3)
+        self.assertIsNone(approval["executed_at"])
+
+    def test_create_requires_existing_environment(self):
+        with self.assertRaises(db_mod.EnvironmentNotFound):
+            self._open(env="ghost")
+        # No approval row was created.
+        self.assertIsNone(db_mod.get_approval(self.conn, 1))
+
+    def test_create_requires_existing_target_version(self):
+        with self.assertRaises(db_mod.VersionNotFound):
+            self._open(target="ghost")
+
+    def test_create_rejects_target_equal_to_current_pointer(self):
+        with self.assertRaises(db_mod.TargetMatchesPointer):
+            self._open(target="v1")
+        # The staging environment is independently on v2.
+        with self.assertRaises(db_mod.TargetMatchesPointer):
+            self._open(env="staging", target="v2")
+        # Moving away then back is a new, valid approval.
+        db_mod.upsert_environment(self.conn, "staging", "v1", 1)
+        approval = self._open(env="staging", target="v2")
+        self.assertEqual(approval["base_revision"], 2)
+
+    def test_applicant_cannot_self_approve(self):
+        approval = self._open(applicant="alice")
+        with self.assertRaises(db_mod.ApplicantCannotApprove):
+            db_mod.vote_approval(self.conn, approval["id"], "alice")
+        self.assertEqual(db_mod.get_approval(self.conn, approval["id"])["vote_count"], 0)
+
+    def test_each_approver_votes_at_most_once(self):
+        approval = self._open()
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        with self.assertRaises(db_mod.ApproverAlreadyVoted):
+            db_mod.vote_approval(self.conn, approval["id"], "bob")
+        detail = db_mod.get_approval(self.conn, approval["id"])
+        self.assertEqual([v["approver"] for v in detail["votes"]], ["bob"])
+        self.assertEqual(detail["remaining_approvals"], 1)
+
+    def test_cannot_execute_before_threshold(self):
+        approval = self._open(required=2)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        with self.assertRaises(db_mod.InsufficientApprovals) as ctx:
+            db_mod.execute_approval(self.conn, approval["id"])
+        self.assertEqual(ctx.exception.votes, 1)
+        self.assertEqual(ctx.exception.required, 2)
+        # Nothing moved.
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v1", 1))
+
+    def test_threshold_execution_moves_pointer_and_appends_history(self):
+        approval = self._open(required=2)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        db_mod.vote_approval(self.conn, approval["id"], "carol")
+        db_mod.execute_approval(self.conn, approval["id"])
+
+        detail = db_mod.get_approval(self.conn, approval["id"])
+        self.assertEqual(detail["status"], db_mod.APPROVAL_EXECUTED)
+        self.assertIsNotNone(detail["executed_at"])
+        self.assertEqual(detail["remaining_approvals"], 0)
+        self.assertEqual(
+            [v["approver"] for v in detail["votes"]], ["bob", "carol"]
+        )
+
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+        history = db_mod.list_environment_history(self.conn, "prod")
+        self.assertEqual(
+            [(h["revision"], h["version"], h["operation"]) for h in history],
+            [(1, "v1", "create"), (2, "v2", "update")],
+        )
+
+    def test_single_required_approval_threshold(self):
+        approval = self._open(required=1)
+        # The applicant still cannot self-approve...
+        with self.assertRaises(db_mod.ApplicantCannotApprove):
+            db_mod.vote_approval(self.conn, approval["id"], "alice")
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        db_mod.execute_approval(self.conn, approval["id"])
+        self.assertEqual(
+            db_mod.get_approval(self.conn, approval["id"])["status"],
+            db_mod.APPROVAL_EXECUTED,
+        )
+
+    def test_revision_changed_at_execution_marks_stale_without_moving(self):
+        approval = self._open(target="v2", required=1)
+        # A concurrent writer moves the pointer first (v1@1 -> v2@2).
+        db_mod.upsert_environment(self.conn, "prod", "v2", 1)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        with self.assertRaises(db_mod.ApprovalStale) as ctx:
+            db_mod.execute_approval(self.conn, approval["id"])
+        self.assertEqual(ctx.exception.base_revision, 1)
+        self.assertEqual(ctx.exception.current_revision, 2)
+
+        detail = db_mod.get_approval(self.conn, approval["id"])
+        self.assertEqual(detail["status"], db_mod.APPROVAL_STALE)
+        self.assertIsNotNone(detail["executed_at"])
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+        # The stale execution appended nothing to the audit trail.
+        self.assertEqual(len(db_mod.list_environment_history(self.conn, "prod")), 2)
+
+    def test_pointer_moved_away_and_back_also_goes_stale(self):
+        # Equal revision implies unchanged; even a round trip must burn a
+        # revision, so base=1 with a later revision is stale regardless of
+        # the target version.
+        approval = self._open(target="v3", required=1)
+        db_mod.upsert_environment(self.conn, "prod", "v2", 1)
+        db_mod.upsert_environment(self.conn, "prod", "v1", 2)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        with self.assertRaises(db_mod.ApprovalStale):
+            db_mod.execute_approval(self.conn, approval["id"])
+        self.assertEqual(
+            db_mod.get_approval(self.conn, approval["id"])["status"],
+            db_mod.APPROVAL_STALE,
+        )
+        self.assertEqual(
+            (db_mod.get_environment(self.conn, "prod")["version"],
+             db_mod.get_environment(self.conn, "prod")["revision"]),
+            ("v1", 3),
+        )
+
+    def test_executed_or_stale_approval_is_terminal(self):
+        done = self._open(required=1)
+        db_mod.vote_approval(self.conn, done["id"], "bob")
+        db_mod.execute_approval(self.conn, done["id"])
+
+        stale = self._open(target="v3", required=1)
+        db_mod.upsert_environment(self.conn, "prod", "v2", 2)
+        db_mod.vote_approval(self.conn, stale["id"], "bob")
+        with self.assertRaises(db_mod.ApprovalStale):
+            db_mod.execute_approval(self.conn, stale["id"])
+
+        for approval_id in (done["id"], stale["id"]):
+            with self.assertRaises(db_mod.ApprovalNotPending):
+                db_mod.vote_approval(self.conn, approval_id, "zoe")
+            with self.assertRaises(db_mod.ApprovalNotPending):
+                db_mod.execute_approval(self.conn, approval_id)
+
+    def test_extra_votes_beyond_threshold_are_allowed(self):
+        approval = self._open(required=1)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        db_mod.vote_approval(self.conn, approval["id"], "carol")
+        detail = db_mod.execute_approval(self.conn, approval["id"])
+        self.assertEqual(detail["vote_count"], 2)
+        self.assertEqual(detail["remaining_approvals"], 0)
+
+    def test_unknown_approval_returns_none_or_not_found(self):
+        self.assertIsNone(db_mod.get_approval(self.conn, 1234))
+        with self.assertRaises(db_mod.ApprovalNotFound):
+            db_mod.vote_approval(self.conn, 1234, "bob")
+        with self.assertRaises(db_mod.ApprovalNotFound):
+            db_mod.execute_approval(self.conn, 1234)
+
+    def test_two_open_approvals_race_first_executes_second_stales(self):
+        a1 = self._open(target="v2", applicant="a", required=1)
+        a2 = self._open(target="v2", applicant="b", required=1)
+        db_mod.vote_approval(self.conn, a1["id"], "x")
+        db_mod.vote_approval(self.conn, a2["id"], "y")
+        db_mod.execute_approval(self.conn, a1["id"])
+        self.assertEqual(
+            db_mod.get_approval(self.conn, a1["id"])["status"],
+            db_mod.APPROVAL_EXECUTED,
+        )
+        with self.assertRaises(db_mod.ApprovalStale):
+            db_mod.execute_approval(self.conn, a2["id"])
+        self.assertEqual(
+            db_mod.get_approval(self.conn, a2["id"])["status"],
+            db_mod.APPROVAL_STALE,
+        )
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+
+    def test_concurrent_execution_exactly_one_wins(self):
+        # N pending, threshold-met approvals all snapshot base revision 1;
+        # exactly one must execute, the rest must come back stale.
+        approvals = [
+            self._open(target="v2", applicant=f"a{i}", required=1) for i in range(6)
+        ]
+        for i, approval in enumerate(approvals):
+            db_mod.vote_approval(self.conn, approval["id"], f"voter-{i}")
+
+        barrier = threading.Barrier(len(approvals))
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+
+        def race(approval_id: int) -> None:
+            conn = db_mod.connect()
+            try:
+                barrier.wait()
+                try:
+                    db_mod.execute_approval(conn, approval_id)
+                    with outcomes_lock:
+                        outcomes.append("executed")
+                except db_mod.ApprovalStale:
+                    with outcomes_lock:
+                        outcomes.append("stale")
+            finally:
+                conn.close()
+
+        threads = [
+            threading.Thread(target=race, args=(a["id"],)) for a in approvals
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(outcomes), ["executed"] + ["stale"] * (len(approvals) - 1))
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+        statuses = [
+            db_mod.get_approval(self.conn, a["id"])["status"] for a in approvals
+        ]
+        self.assertEqual(sorted(statuses), ["executed"] + ["stale"] * (len(approvals) - 1))
+        # Exactly one history row was appended by the batch.
+        history = db_mod.list_environment_history(self.conn, "prod")
+        self.assertEqual([h["revision"] for h in history], [1, 2])
+
+    def test_stale_execution_concurrent_with_direct_put_keeps_pointer(self):
+        # The approval targets v3; a direct PUT and the execution race. If
+        # the PUT commits first, execution stales and v3 never lands.
+        approval = self._open(target="v3", required=1)
+        db_mod.vote_approval(self.conn, approval["id"], "bob")
+        db_mod.upsert_environment(self.conn, "prod", "v3", 1)
+        with self.assertRaises(db_mod.ApprovalStale):
+            db_mod.execute_approval(self.conn, approval["id"])
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v3", 2))
+        history = db_mod.list_environment_history(self.conn, "prod")
+        self.assertEqual(len(history), 2)
+
+    def test_vote_detail_returns_votes_in_cast_order_with_timestamps(self):
+        approval = self._open(required=3)
+        for approver in ("bob", "carol", "dave"):
+            db_mod.vote_approval(self.conn, approval["id"], approver)
+        detail = db_mod.get_approval(self.conn, approval["id"])
+        self.assertEqual([v["approver"] for v in detail["votes"]], ["bob", "carol", "dave"])
+        self.assertTrue(all(v["voted_at"] for v in detail["votes"]))
+
+
 if __name__ == "__main__":
     unittest.main()

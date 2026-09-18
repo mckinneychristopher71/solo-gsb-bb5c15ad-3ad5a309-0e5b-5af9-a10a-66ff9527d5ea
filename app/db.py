@@ -19,6 +19,17 @@ version, the operation (``create``/``update``) and a timestamp. The row is
 insert-only — nothing ever updates or deletes it — so the table is a
 gap-free, immutable audit trail of how each pointer moved. Failed or stale
 writes raise before the insert and roll back, leaving no record behind.
+
+Environment *change approvals* add a gated path for moving a pointer. An
+approval records the environment, a target version, the pointer revision it
+was opened against (``base_revision``), the applicant and how many distinct
+approvers must vote (1–5). The applicant can never vote, each approver votes
+at most once, and execution is only allowed once the vote count reaches the
+threshold. Execution re-checks the pointer revision **inside the same
+``BEGIN IMMEDIATE`` transaction** that performs the move (and its history
+append): if the revision still equals ``base_revision`` the pointer moves;
+if it changed meanwhile the approval is instead marked ``stale`` and the
+pointer is left exactly where it was.
 """
 
 from __future__ import annotations
@@ -65,6 +76,104 @@ class VersionNotFound(Exception):
     def __init__(self, version: str):
         self.version = version
         super().__init__(f"config version {version!r} not found")
+
+
+class EnvironmentNotFound(Exception):
+    """Raised when an approval references an environment that does not exist."""
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"environment {name!r} not found")
+
+
+# ---------------------------------------------------------------------------
+# Environment change approvals
+# ---------------------------------------------------------------------------
+
+APPROVAL_PENDING = "pending"
+APPROVAL_EXECUTED = "executed"
+APPROVAL_STALE = "stale"
+
+
+class ApprovalNotFound(Exception):
+    """Raised when an approval id does not exist."""
+
+    def __init__(self, approval_id: int):
+        self.approval_id = approval_id
+        super().__init__(f"approval {approval_id} not found")
+
+
+class TargetMatchesPointer(Exception):
+    """Raised when an approval targets the version the pointer is already on."""
+
+    def __init__(self, name: str, version: str):
+        self.name = name
+        self.version = version
+        super().__init__(
+            f"target version {version!r} is already the current pointer"
+            f" of environment {name!r}"
+        )
+
+
+class ApprovalNotPending(Exception):
+    """Raised when voting on / executing an approval that is no longer pending."""
+
+    def __init__(self, approval_id: int, status: str):
+        self.approval_id = approval_id
+        self.status = status
+        super().__init__(f"approval {approval_id} is {status}, not pending")
+
+
+class ApplicantCannotApprove(Exception):
+    """Raised when the applicant tries to vote on their own approval."""
+
+    def __init__(self, approval_id: int, applicant: str):
+        self.approval_id = approval_id
+        self.applicant = applicant
+        super().__init__(
+            f"applicant {applicant!r} cannot approve approval {approval_id}"
+        )
+
+
+class ApproverAlreadyVoted(Exception):
+    """Raised when an approver votes on the same approval a second time."""
+
+    def __init__(self, approval_id: int, approver: str):
+        self.approval_id = approval_id
+        self.approver = approver
+        super().__init__(
+            f"approver {approver!r} has already voted on approval {approval_id}"
+        )
+
+
+class InsufficientApprovals(Exception):
+    """Raised when execution is attempted before the vote threshold is met."""
+
+    def __init__(self, approval_id: int, votes: int, required: int):
+        self.approval_id = approval_id
+        self.votes = votes
+        self.required = required
+        super().__init__(
+            f"approval {approval_id} has {votes} of {required} required approvals"
+        )
+
+
+class ApprovalStale(Exception):
+    """Raised (after marking the approval stale) when execution finds the
+    environment pointer has moved since the approval was opened.
+
+    The approval row has already been flipped to ``stale`` in the same
+    transaction; the pointer itself is never modified.
+    """
+
+    def __init__(self, approval_id: int, base_revision: int, current_revision: int):
+        self.approval_id = approval_id
+        self.base_revision = base_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"approval {approval_id} is stale: environment revision was"
+            f" {base_revision} when opened but is {current_revision} now"
+        )
 
 
 def _utcnow() -> str:
@@ -128,6 +237,46 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at   TEXT NOT NULL,
             UNIQUE (environment, revision)
         )
+        """
+    )
+    # Gated environment changes. ``base_revision`` snapshots the pointer
+    # revision at creation time; execution only moves the pointer when the
+    # revision still matches. An approval row is created in ``pending`` and
+    # transitions exactly once, to ``executed`` (pointer moved) or ``stale``
+    # (pointer had moved meanwhile; pointer untouched).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS environment_approvals (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            environment        TEXT NOT NULL,
+            target_version     TEXT NOT NULL,
+            base_revision      INTEGER NOT NULL,
+            applicant          TEXT NOT NULL,
+            required_approvals INTEGER NOT NULL,
+            status             TEXT NOT NULL,
+            created_at         TEXT NOT NULL,
+            executed_at        TEXT
+        )
+        """
+    )
+    # One vote per distinct approver per approval; the applicant is rejected
+    # by the application layer before any insert reaches this table.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approval_votes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_id INTEGER NOT NULL,
+            approver    TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE (approval_id, approver),
+            FOREIGN KEY (approval_id) REFERENCES environment_approvals(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_approvals_environment
+            ON environment_approvals(environment)
         """
     )
     conn.commit()
@@ -385,3 +534,238 @@ def _version_exists(conn: sqlite3.Connection, version: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# Environment change approvals
+# ---------------------------------------------------------------------------
+
+
+def _approval_row(
+    conn: sqlite3.Connection, approval_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, environment, target_version, base_revision, applicant,"
+        "       required_approvals, status, created_at, executed_at"
+        " FROM environment_approvals WHERE id = ?",
+        (approval_id,),
+    ).fetchone()
+
+
+def _list_votes(conn: sqlite3.Connection, approval_id: int) -> list[dict[str, Any]]:
+    """Votes in cast order (insertion order = ascending vote id)."""
+    rows = conn.execute(
+        "SELECT approver, created_at FROM approval_votes"
+        " WHERE approval_id = ? ORDER BY id ASC",
+        (approval_id,),
+    ).fetchall()
+    return [
+        {"approver": row["approver"], "voted_at": row["created_at"]} for row in rows
+    ]
+
+
+def create_approval(
+    conn: sqlite3.Connection,
+    environment: str,
+    target_version: str,
+    applicant: str,
+    required_approvals: int,
+) -> dict[str, Any]:
+    """Open a pending change approval for an environment pointer.
+
+    The environment must exist, the target version must be published, and it
+    must differ from the version the pointer currently names. The pointer's
+    current revision is snapshotted as ``base_revision`` for the later
+    execution-time re-check. All checks run inside one ``BEGIN IMMEDIATE``
+    transaction; failures roll back without creating a row.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = _env_row(conn, environment)
+        if existing is None:
+            raise EnvironmentNotFound(environment)
+        # Unknown target version wins over the "same pointer" check: callers
+        # must not learn "already there" for a version that was never
+        # published.
+        if not _version_exists(conn, target_version):
+            raise VersionNotFound(target_version)
+        if existing["version"] == target_version:
+            raise TargetMatchesPointer(environment, target_version)
+
+        now = _utcnow()
+        cursor = conn.execute(
+            "INSERT INTO environment_approvals"
+            " (environment, target_version, base_revision, applicant,"
+            "  required_approvals, status, created_at, executed_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                environment,
+                target_version,
+                existing["revision"],
+                applicant,
+                required_approvals,
+                APPROVAL_PENDING,
+                now,
+            ),
+        )
+        approval_id = cursor.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return get_approval(conn, approval_id)
+
+
+def vote_approval(
+    conn: sqlite3.Connection, approval_id: int, approver: str
+) -> dict[str, Any]:
+    """Cast one approval vote.
+
+    The approval must still be pending, the approver must not be the
+    applicant, and the same approver can vote only once (enforced both here
+    and by ``UNIQUE(approval_id, approver)``). Returns the updated approval
+    detail; reaching the threshold does not execute automatically — the
+    caller invokes :func:`execute_approval`.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = _approval_row(conn, approval_id)
+        if row is None:
+            raise ApprovalNotFound(approval_id)
+        if row["status"] != APPROVAL_PENDING:
+            raise ApprovalNotPending(approval_id, row["status"])
+        if approver == row["applicant"]:
+            raise ApplicantCannotApprove(approval_id, approver)
+
+        already = conn.execute(
+            "SELECT 1 FROM approval_votes WHERE approval_id = ? AND approver = ?",
+            (approval_id, approver),
+        ).fetchone()
+        if already is not None:
+            raise ApproverAlreadyVoted(approval_id, approver)
+
+        conn.execute(
+            "INSERT INTO approval_votes (approval_id, approver, created_at)"
+            " VALUES (?, ?, ?)",
+            (approval_id, approver, _utcnow()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return get_approval(conn, approval_id)
+
+
+def execute_approval(conn: sqlite3.Connection, approval_id: int) -> dict[str, Any]:
+    """Execute a threshold-met approval, re-checking the pointer in the same
+    transaction.
+
+    Inside one ``BEGIN IMMEDIATE`` transaction:
+
+      * the approval must be ``pending`` and hold at least
+        ``required_approvals`` distinct votes;
+      * the environment pointer's revision is read again and compared with
+        the ``base_revision`` snapshotted at creation:
+          - unchanged → move the pointer to ``target_version``, increment the
+            revision and append an ``update`` row to ``environment_history``
+            (exactly as a direct pointer PUT would), all atomically;
+          - changed (or the environment vanished) → flip the approval to
+            ``stale`` and leave the pointer untouched.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = _approval_row(conn, approval_id)
+        if row is None:
+            raise ApprovalNotFound(approval_id)
+        if row["status"] != APPROVAL_PENDING:
+            raise ApprovalNotPending(approval_id, row["status"])
+
+        vote_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM approval_votes WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()["n"]
+        if vote_count < row["required_approvals"]:
+            raise InsufficientApprovals(
+                approval_id, vote_count, row["required_approvals"]
+            )
+
+        now = _utcnow()
+        env = _env_row(conn, row["environment"])
+        # A different revision (including the environment no longer existing,
+        # treated as revision 0) means someone else moved the pointer after
+        # this approval was opened: mark the approval stale, do not write to
+        # the pointer or the audit trail.
+        if env is None or env["revision"] != row["base_revision"]:
+            current_revision = env["revision"] if env is not None else 0
+            conn.execute(
+                "UPDATE environment_approvals SET status = ?, executed_at = ?"
+                " WHERE id = ?",
+                (APPROVAL_STALE, now, approval_id),
+            )
+            conn.commit()
+            raise ApprovalStale(
+                approval_id, row["base_revision"], current_revision
+            )
+
+        target = row["target_version"]
+        new_revision = env["revision"] + 1
+        # The target version's existence was guaranteed at creation time and
+        # config versions are immutable/never deleted, so it still exists.
+        conn.execute(
+            "UPDATE environments SET version = ?, revision = revision + 1,"
+            " updated_at = ? WHERE name = ? AND revision = ?",
+            (target, now, env["name"], env["revision"]),
+        )
+        conn.execute(
+            "INSERT INTO environment_history"
+            " (environment, revision, version, operation, created_at)"
+            " VALUES (?, ?, ?, 'update', ?)",
+            (env["name"], new_revision, target, now),
+        )
+        conn.execute(
+            "UPDATE environment_approvals SET status = ?, executed_at = ?"
+            " WHERE id = ?",
+            (APPROVAL_EXECUTED, now, approval_id),
+        )
+        conn.commit()
+    except ApprovalStale:
+        # The stale transition was already committed above; do not roll it
+        # back in the generic handler.
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+
+    return get_approval(conn, approval_id)
+
+
+def get_approval(
+    conn: sqlite3.Connection, approval_id: int
+) -> Optional[dict[str, Any]]:
+    """Return an approval with its votes and current approval counts, or
+    ``None`` when the id is unknown."""
+    row = _approval_row(conn, approval_id)
+    if row is None:
+        return None
+    votes = _list_votes(conn, approval_id)
+    return {
+        "id": row["id"],
+        "environment": row["environment"],
+        "target_version": row["target_version"],
+        "base_revision": row["base_revision"],
+        "applicant": row["applicant"],
+        "required_approvals": row["required_approvals"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "executed_at": row["executed_at"],
+        "votes": votes,
+        "vote_count": len(votes),
+        "remaining_approvals": max(
+            0, row["required_approvals"] - len(votes)
+        ),
+    }

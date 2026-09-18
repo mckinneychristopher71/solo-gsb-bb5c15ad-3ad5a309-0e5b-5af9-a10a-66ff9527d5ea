@@ -280,3 +280,43 @@ class EnvironmentEvalResponse(BaseModel):
     context: dict[str, Any]
     results: list[EvalResult]
     missing_flags: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Environment change approval models
+# ---------------------------------------------------------------------------
+
+MIN_REQUIRED_APPROVALS = 1
+MAX_REQUIRED_APPROVALS = 5
+
+
+class ApprovalCreateRequest(StrictModel):
+    target_version: str = Field(min_length=1)
+    applicant: str = Field(min_length=1)
+    required_approvals: int = Field(
+        ge=MIN_REQUIRED_APPROVALS, le=MAX_REQUIRED_APPROVALS
+    )
+
+
+class ApprovalVoteRequest(StrictModel):
+    approver: str = Field(min_length=1)
+
+
+class ApprovalVote(BaseModel):
+    approver: str
+    voted_at: str
+
+
+class ApprovalResponse(BaseModel):
+    id: int
+    environment: str
+    target_version: str
+    base_revision: int
+    applicant: str
+    required_approvals: int
+    status: Literal["pending", "executed", "stale"]
+    created_at: str
+    executed_at: Optional[str] = None
+    votes: list[ApprovalVote]
+    vote_count: int
+    remaining_approvals: int
