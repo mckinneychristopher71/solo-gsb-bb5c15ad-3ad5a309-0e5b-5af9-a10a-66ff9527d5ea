@@ -4,6 +4,7 @@ Run with:  python3 -m unittest discover -s tests -v
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -1411,6 +1412,273 @@ class EnvironmentHistoryTests(unittest.TestCase):
         self.assertEqual([h["revision"] for h in history], [1, 2])
         self.assertEqual(history[-1]["operation"], "update")
         self.assertEqual(history[-1]["version"], "v2")
+
+
+class ChangeApprovalTests(unittest.TestCase):
+    """Review-then-execute pointer moves: create -> vote -> execute."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FLAG_DB_PATH"] = os.path.join(self.tmp.name, "test.db")
+        self.conn = db_mod.connect()
+        db_mod.init_db(self.conn)
+        for version in ("v1", "v2", "v3"):
+            db_mod.insert_version(
+                self.conn,
+                version,
+                {"flags": {"f": {"enabled": True, "default": version, "rules": []}}},
+            )
+        # Environment "prod" starts at v1, revision 1.
+        db_mod.upsert_environment(self.conn, "prod", "v1", 0)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def _create(self, **overrides):
+        params = {
+            "environment": "prod",
+            "target_version": "v2",
+            "base_revision": 1,
+            "applicant": "alice",
+            "required_approvals": 2,
+        }
+        params.update(overrides)
+        return db_mod.create_change_approval(self.conn, **params)
+
+    def _vote(self, approval_id, approver):
+        return db_mod.add_approval_vote(self.conn, approval_id, approver)
+
+    # -- creation ----------------------------------------------------------
+
+    def test_create_records_all_fields_as_pending(self):
+        approval = self._create()
+        self.assertEqual(approval["environment"], "prod")
+        self.assertEqual(approval["target_version"], "v2")
+        self.assertEqual(approval["base_revision"], 1)
+        self.assertEqual(approval["applicant"], "alice")
+        self.assertEqual(approval["required_approvals"], 2)
+        self.assertEqual(approval["status"], "pending")
+        self.assertEqual(approval["votes"], 0)
+        self.assertEqual(approval["approvers"], [])
+        self.assertIsNone(approval["executed_at"])
+        self.assertIsNone(approval["executed_revision"])
+        self.assertIn("created_at", approval)
+
+        loaded = db_mod.get_change_approval(self.conn, approval["id"])
+        self.assertEqual(loaded, approval)
+
+    def test_create_unknown_environment_raises_and_stores_nothing(self):
+        with self.assertRaises(db_mod.EnvironmentNotFound):
+            self._create(environment="ghost")
+        self.assertIsNone(db_mod.get_change_approval(self.conn, 1))
+
+    def test_create_stale_base_revision_raises(self):
+        with self.assertRaises(db_mod.StaleRevision) as ctx:
+            self._create(base_revision=99)
+        self.assertEqual(ctx.exception.current, 1)
+        self.assertIsNone(db_mod.get_change_approval(self.conn, 1))
+
+    def test_create_unknown_target_version_raises(self):
+        with self.assertRaises(db_mod.VersionNotFound):
+            self._create(target_version="ghost")
+        self.assertIsNone(db_mod.get_change_approval(self.conn, 1))
+
+    def test_create_targeting_current_version_raises_no_change(self):
+        with self.assertRaises(db_mod.NoChange):
+            self._create(target_version="v1")
+        self.assertIsNone(db_mod.get_change_approval(self.conn, 1))
+
+    def test_stale_base_revision_takes_precedence_over_missing_version(self):
+        with self.assertRaises(db_mod.StaleRevision):
+            self._create(base_revision=99, target_version="ghost")
+
+    def test_required_approvals_out_of_range_violates_check(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._create(required_approvals=0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._create(required_approvals=6)
+
+    # -- voting ------------------------------------------------------------
+
+    def test_vote_records_distinct_approvers_in_order(self):
+        approval = self._create()
+        updated = self._vote(approval["id"], "bob")
+        self.assertEqual(updated["votes"], 1)
+        self.assertEqual(updated["approvers"], ["bob"])
+        updated = self._vote(approval["id"], "carol")
+        self.assertEqual(updated["votes"], 2)
+        self.assertEqual(updated["approvers"], ["bob", "carol"])
+        # The request stays pending until it is executed.
+        self.assertEqual(updated["status"], "pending")
+
+    def test_duplicate_vote_rejected_and_count_unchanged(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")
+        with self.assertRaises(db_mod.DuplicateVote):
+            self._vote(approval["id"], "bob")
+        loaded = db_mod.get_change_approval(self.conn, approval["id"])
+        self.assertEqual(loaded["votes"], 1)
+        self.assertEqual(loaded["approvers"], ["bob"])
+
+    def test_applicant_cannot_self_approve(self):
+        approval = self._create()
+        with self.assertRaises(db_mod.SelfApproval):
+            self._vote(approval["id"], "alice")
+        self.assertEqual(
+            db_mod.get_change_approval(self.conn, approval["id"])["votes"], 0
+        )
+
+    def test_vote_on_unknown_approval_raises(self):
+        with self.assertRaises(db_mod.ApprovalNotFound):
+            self._vote(999, "bob")
+
+    # -- execution -----------------------------------------------------------
+
+    def test_execute_before_threshold_raises_and_keeps_pointer(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")  # 1 of 2 required
+        with self.assertRaises(db_mod.ApprovalsNotMet) as ctx:
+            db_mod.execute_change_approval(self.conn, approval["id"])
+        self.assertEqual(ctx.exception.votes, 1)
+        self.assertEqual(ctx.exception.required, 2)
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v1", 1))
+        self.assertEqual(
+            db_mod.get_change_approval(self.conn, approval["id"])["status"],
+            "pending",
+        )
+
+    def test_execute_moves_pointer_and_appends_history(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")
+        self._vote(approval["id"], "carol")
+        executed = db_mod.execute_change_approval(self.conn, approval["id"])
+
+        self.assertEqual(executed["status"], "executed")
+        self.assertEqual(executed["votes"], 2)
+        self.assertEqual(executed["executed_revision"], 2)
+        self.assertIsNotNone(executed["executed_at"])
+
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v2", 2))
+
+        history = db_mod.list_environment_history(self.conn, "prod")
+        self.assertEqual([h["revision"] for h in history], [1, 2])
+        self.assertEqual(history[-1]["version"], "v2")
+        self.assertEqual(history[-1]["operation"], "update")
+        # History record and pointer share one transaction timestamp.
+        self.assertEqual(history[-1]["created_at"], env["updated_at"])
+
+    def test_execute_with_more_votes_than_required_still_works(self):
+        approval = self._create(required_approvals=1)
+        self._vote(approval["id"], "bob")
+        self._vote(approval["id"], "carol")
+        executed = db_mod.execute_change_approval(self.conn, approval["id"])
+        self.assertEqual(executed["status"], "executed")
+        self.assertEqual(executed["votes"], 2)
+
+    def test_execute_marks_stale_when_revision_changed(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")
+        self._vote(approval["id"], "carol")
+        # The pointer moves behind the approval's back: revision 1 -> 2.
+        db_mod.upsert_environment(self.conn, "prod", "v3", 1)
+
+        with self.assertRaises(db_mod.StaleRevision) as ctx:
+            db_mod.execute_change_approval(self.conn, approval["id"])
+        self.assertEqual(ctx.exception.expected, 1)
+        self.assertEqual(ctx.exception.current, 2)
+
+        # The request is now stale; the pointer and history are untouched.
+        stale = db_mod.get_change_approval(self.conn, approval["id"])
+        self.assertEqual(stale["status"], "stale")
+        self.assertIsNone(stale["executed_at"])
+        self.assertIsNone(stale["executed_revision"])
+        env = db_mod.get_environment(self.conn, "prod")
+        self.assertEqual((env["version"], env["revision"]), ("v3", 2))
+        history = db_mod.list_environment_history(self.conn, "prod")
+        self.assertEqual([h["revision"] for h in history], [1, 2])
+        self.assertEqual(history[-1]["version"], "v3")
+
+    def test_executed_approval_rejects_votes_and_reexecution(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")
+        self._vote(approval["id"], "carol")
+        db_mod.execute_change_approval(self.conn, approval["id"])
+
+        with self.assertRaises(db_mod.ApprovalNotPending) as ctx:
+            self._vote(approval["id"], "dave")
+        self.assertEqual(ctx.exception.status, "executed")
+        with self.assertRaises(db_mod.ApprovalNotPending):
+            db_mod.execute_change_approval(self.conn, approval["id"])
+        # Pointer unchanged by the rejected operations.
+        self.assertEqual(db_mod.get_environment(self.conn, "prod")["revision"], 2)
+
+    def test_stale_approval_rejects_votes_and_reexecution(self):
+        approval = self._create()
+        self._vote(approval["id"], "bob")
+        self._vote(approval["id"], "carol")
+        db_mod.upsert_environment(self.conn, "prod", "v3", 1)
+        with self.assertRaises(db_mod.StaleRevision):
+            db_mod.execute_change_approval(self.conn, approval["id"])
+
+        with self.assertRaises(db_mod.ApprovalNotPending) as ctx:
+            self._vote(approval["id"], "dave")
+        self.assertEqual(ctx.exception.status, "stale")
+        with self.assertRaises(db_mod.ApprovalNotPending):
+            db_mod.execute_change_approval(self.conn, approval["id"])
+
+    def test_execute_unknown_approval_raises(self):
+        with self.assertRaises(db_mod.ApprovalNotFound):
+            db_mod.execute_change_approval(self.conn, 999)
+
+    def test_approvals_are_independent_per_environment(self):
+        db_mod.upsert_environment(self.conn, "staging", "v2", 0)
+        prod_approval = self._create()
+        staging_approval = self._create(
+            environment="staging", target_version="v1", base_revision=1
+        )
+        self.assertNotEqual(prod_approval["id"], staging_approval["id"])
+
+        self._vote(prod_approval["id"], "bob")
+        self.assertEqual(
+            db_mod.get_change_approval(self.conn, staging_approval["id"])["votes"],
+            0,
+        )
+
+    def test_concurrent_duplicate_votes_exactly_one_wins(self):
+        approval = self._create()
+        n = 8
+        barrier = threading.Barrier(n)
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+
+        def race() -> None:
+            conn = db_mod.connect()
+            try:
+                barrier.wait()
+                try:
+                    db_mod.add_approval_vote(conn, approval["id"], "bob")
+                    with outcomes_lock:
+                        outcomes.append("ok")
+                except db_mod.DuplicateVote:
+                    with outcomes_lock:
+                        outcomes.append("duplicate")
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=race) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(outcomes), ["duplicate"] * (n - 1) + ["ok"])
+        loaded = db_mod.get_change_approval(self.conn, approval["id"])
+        self.assertEqual(loaded["votes"], 1)
+        self.assertEqual(loaded["approvers"], ["bob"])
 
 
 if __name__ == "__main__":

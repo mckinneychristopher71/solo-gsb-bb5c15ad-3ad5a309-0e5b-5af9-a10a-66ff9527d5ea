@@ -280,3 +280,38 @@ class EnvironmentEvalResponse(BaseModel):
     context: dict[str, Any]
     results: list[EvalResult]
     missing_flags: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Change approval models
+# ---------------------------------------------------------------------------
+
+# A change may require between 1 and 5 distinct approvers.
+MAX_REQUIRED_APPROVALS = 5
+
+
+class ChangeApprovalCreateRequest(StrictModel):
+    environment: str = Field(min_length=1)
+    target_version: str = Field(min_length=1)
+    base_revision: int = Field(ge=1)
+    applicant: str = Field(min_length=1)
+    required_approvals: int = Field(ge=1, le=MAX_REQUIRED_APPROVALS)
+
+
+class ApprovalVoteRequest(StrictModel):
+    approver: str = Field(min_length=1)
+
+
+class ChangeApprovalResponse(BaseModel):
+    id: int
+    environment: str
+    target_version: str
+    base_revision: int
+    applicant: str
+    required_approvals: int
+    status: Literal["pending", "executed", "stale"]
+    votes: int
+    approvers: list[str]
+    created_at: str
+    executed_at: Optional[str] = None
+    executed_revision: Optional[int] = None

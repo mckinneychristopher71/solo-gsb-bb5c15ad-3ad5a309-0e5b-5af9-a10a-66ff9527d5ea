@@ -13,6 +13,7 @@
 - 🔬 **评估预览**：发布前用两个已发布版本对一批样本（唯一 `subject_id` + `user_id` + `attributes`）逐一计算“样本 × 开关”的判定差异；**存在性或 `value` 的 JSON 类型/值不同才算 changed**，仅 `reason`/`rule_id` 不同不算；changed 明细按请求排序并回显双方的 `exists`/`value`/`reason`/`rule_id`，另按开关汇总 changed/unchanged；每个“版本 × 样本”使用独立判定器，分组缓存绝不跨样本复用。
 - 🌍 **环境指针 + 乐观并发**：`production`/`staging` 等环境是指向已发布版本的**指针**，带单调递增的 `revision`。创建只接受 `expected_revision=0`（初始 revision 为 1），更新须凭当前 revision 换号；同一 `BEGIN IMMEDIATE` 事务内完成校验、版本存在性确认与 revision 加一，竞争或过期写入得到 `409 stale_revision` 且指针不变。环境级判定单次请求使用同一指针快照，响应回显 `version` 与 `revision`。
 - 📜 **修订审计（不可变历史）**：每次成功创建/移动环境指针，都会在**同一事务**内向 `environment_history` 追加一条不可变记录（环境名、revision、目标 version、操作类型 `create`/`update`、时间）；失败或过期写入回滚、不产生任何记录。`GET /api/v1/environments/{name}/history` 按 revision 升序返回审计轨迹，支持 `from_revision`/`limit` 前向翻页，环境不存在返回 404。
+- ✅ **环境变更审批**：指针移动可走"申请 → 投票 → 执行"流程。创建审批单时记录环境、目标版本、`base_revision`（申请人观察到的指针 revision）、申请人与所需审批人数 `required_approvals`（1–5）；目标版本必须已发布且不同于当前指针。每位审批人限投一票、申请人不得自批；票数达标后允许执行——执行在**同一个 `BEGIN IMMEDIATE` 事务**内再次校验环境 revision：未变化则移动指针并追加不可变审计记录，已变化则把审批单标记 `stale` 且指针不变。详情查询返回 `pending`/`executed`/`stale` 状态与当前票数。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID、悬空分组引用与分组循环一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
 
@@ -334,6 +335,39 @@ curl -s -X POST http://localhost:8000/api/v1/evaluation-previews \
 - **判定器作用域**：每个“版本 × 样本”使用独立判定器——同一样本的多个开关共享分组（segment）计算结果，但分组缓存**绝不跨样本复用**；
 - **错误**：`subject_id` 重复、`subjects` 超过 200 或 `flags` 超过 50 → `422 invalid_request`；任一版本不存在 → `404 version_not_found`（先确认两个版本都存在再开始计算，不会返回部分结果）。
 
+### 12. 环境变更审批（申请 → 投票 → 执行）
+
+除了直接 `PUT /api/v1/environments/{name}`，指针移动也可以走审批流程：申请人先开一张审批单，集齐足够的不同审批人投票后，执行才会把指针移到目标版本：
+
+```bash
+# 1) 创建审批单（production 当前指向 v1、revision=1；目标版本必须已发布且 ≠ 当前指针）
+curl -s -X POST http://localhost:8000/api/v1/change-approvals \
+  -H 'Content-Type: application/json' --data @examples/approval_create.json
+# 201 → {"id":1,"environment":"production","target_version":"v2","base_revision":1,
+#        "applicant":"alice","required_approvals":2,"status":"pending",
+#        "votes":0,"approvers":[],"created_at":"...","executed_at":null,"executed_revision":null}
+
+# 2) 审批人投票（每位审批人限一票；申请人 alice 不得自批）
+curl -s -X POST http://localhost:8000/api/v1/change-approvals/1/votes \
+  -H 'Content-Type: application/json' --data @examples/approval_vote.json      # bob
+curl -s -X POST http://localhost:8000/api/v1/change-approvals/1/votes \
+  -H 'Content-Type: application/json' -d '{"approver":"carol"}'                # carol
+
+# 3) 票数达标后执行：同一事务内再次校验 revision，未变化则移动指针并追加审计记录
+curl -s -X POST http://localhost:8000/api/v1/change-approvals/1/execute
+# 200 → {"status":"executed","votes":2,"executed_revision":2,"executed_at":"...",...}
+
+# 4) 详情查询：状态（pending/executed/stale）、票数与审批人名单
+curl -s http://localhost:8000/api/v1/change-approvals/1
+```
+
+语义与错误：
+
+- **创建**：环境不存在 → `404 environment_not_found`；`base_revision` 与当前 revision 不一致 → `409 stale_revision`（带 `current_revision`）；目标版本未发布 → `404 version_not_found`；目标版本就是当前指针 → `409 no_change`；`required_approvals` 超出 1–5 或缺字段 → `422 invalid_request`；
+- **投票**：审批单不存在 → `404 approval_not_found`；审批单已执行/已失效 → `409 approval_closed`（回显当前 `status`）；申请人投自己的单 → `409 self_approval`；同一审批人重复投票 → `409 duplicate_vote`（并发下由 `PRIMARY KEY (approval_id, approver)` 兜底，恰有一票成功）；
+- **执行**：票数未达 `required_approvals` → `409 approvals_not_met`（回显 `votes` 与 `required_approvals`），指针不动；执行时环境 revision 已与 `base_revision` 不同（指针被其他途径移动过）→ 审批单被标记 `stale`（该状态**会落库**）并返回 `409 stale_revision`，**指针与历史不变**；revision 未变化则在同一事务内完成“revision+1 移动指针 + 追加 `environment_history`（`operation=update`）+ 审批单标记 `executed`”，三者同生共死；
+- **详情**：`GET /api/v1/change-approvals/{id}` 返回 `status`（`pending` 待审 / `executed` 已执行 / `stale` 已失效）、`votes` 票数与 `approvers` 名单；已执行的单还带 `executed_at` 与 `executed_revision`（即指针移动后的新 revision）。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -411,6 +445,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 - 同一版本的配置以规范化 JSON 整体存入 SQLite（`config_versions` 表，主键即版本号），**只增不改**；
 - 环境指针存于 `environments` 表（`version` 外键指向 `config_versions`），指针可移动但版本文档永不变更；更新在单个 `BEGIN IMMEDIATE` 事务内完成“校验 revision → 确认版本存在 → revision+1 写入”，不会出现丢失更新或悬空指针；
 - 每次成功的指针写入在同一事务内向 `environment_history` 表追加一条不可变审计记录（`UNIQUE(environment, revision)`，只插入、永不更新/删除）；失败写入整体回滚，因此每个环境的 revision 序列从 1 起连续无空洞，审计轨迹与指针状态严格一致；
+- 变更审批单存于 `change_approvals` 表、投票存于 `approval_votes` 表（`PRIMARY KEY (approval_id, approver)` 保证同一审批人至多一票）；执行时“再次校验 revision → 移动指针 → 追加审计 → 标记审批单”在同一个 `BEGIN IMMEDIATE` 事务内完成，审批单状态（`pending`/`executed`/`stale`）与指针、历史严格一致；revision 已变化时仅提交“标记 stale”这一个写操作，指针与历史保持不动；
 - 判定是纯函数：`(配置, user_id, attributes) → 结果`，无随机数、无时间因子；
 - 哈希同时混入开关名（盐），不同开关互不相关；放量从 0→100 单调，不会反复抖动。
 
@@ -429,6 +464,10 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/api/v1/environments/{name}` | 读取环境指针，返回 `{name, version, revision, created_at, updated_at}`（环境不存在返回 404 `environment_not_found`） |
 | `GET` | `/api/v1/environments/{name}/history` | 读取环境修订审计轨迹，按 revision 升序返回 `{name, history[]}`（每条含 `revision`/`version`/`operation`/`created_at`）；支持 `from_revision`（≥0，默认 0）与 `limit`（1–1000，默认 100）前向翻页；环境不存在返回 404 `environment_not_found` |
 | `POST` | `/api/v1/environments/{name}/evaluate` | 面向环境的批量判定，请求体 `{flags[], user_id?, attributes?}`，响应回显指针 `version`/`revision`，单次请求使用同一指针快照（环境不存在返回 404） |
+| `POST` | `/api/v1/change-approvals` | 创建环境变更审批单，请求体 `{environment, target_version, base_revision, applicant, required_approvals(1–5)}`；目标版本须已发布且 ≠ 当前指针（201；环境不存在 404 `environment_not_found`、revision 过期 409 `stale_revision`、版本不存在 404 `version_not_found`、目标即当前指针 409 `no_change`） |
+| `GET` | `/api/v1/change-approvals/{id}` | 审批单详情：`status`（`pending`/`executed`/`stale`）、`votes` 票数、`approvers` 名单及执行结果（不存在返回 404 `approval_not_found`） |
+| `POST` | `/api/v1/change-approvals/{id}/votes` | 审批人投票，请求体 `{approver}`；每人限一票、申请人不得自批（201；重复投票 409 `duplicate_vote`、自批 409 `self_approval`、非待审 409 `approval_closed`） |
+| `POST` | `/api/v1/change-approvals/{id}/execute` | 票数达标后执行：同一事务内再次校验 revision，未变则移动指针并追加审计记录（200），已变则标记 `stale` 且指针不变（409 `stale_revision`）；票数不足 409 `approvals_not_met` |
 | `POST` | `/api/v1/evaluate` | 按显式版本批量判定，请求体 `{version, flags[], user_id?, attributes?}` |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -459,7 +498,7 @@ python3 -m unittest discover -s tests -v
 pip install httpx   # 仅测试需要；生产镜像只安装 requirements.txt
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、评估预览（值变化回显双方明细、reason/rule_id 差异忽略、JSON 类型敏感的结构化比较、存在性差异、双版本均缺失、明细按请求排序、按开关汇总、分流按各样本 user_id 计算、分组缓存在“版本 × 样本”内共享且不跨样本复用）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”；修订审计覆盖创建/更新各写一条记录、记录与指针同事务（失败/过期/未知版本写入不留记录）、revision 序列连续无空洞、回滚追加新记录而不改写历史、按 revision 升序、`from_revision`/`limit` 过滤与翻页、多环境历史相互独立、并发竞争失败者不留记录、记录时间与指针 `updated_at` 一致；另有 `tests/test_api_validation.py` 通过 FastAPI TestClient 做接口回归：重复 `subject_id` 返回 422 `invalid_request` 信封（而非 500）、`errors[]` 保留 `loc`/`type`/`msg`/`input` 且 `ctx` 异常被字符串化、普通字段错误（含 `ctx` 数值）、缺失/多余字段与非法 JSON 走同一处理器、版本不存在仍为 404、合法预演仍返回 200，以及历史接口的升序返回/404/查询参数过滤/失败写入不留记录/非法参数 422。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、评估预览（值变化回显双方明细、reason/rule_id 差异忽略、JSON 类型敏感的结构化比较、存在性差异、双版本均缺失、明细按请求排序、按开关汇总、分流按各样本 user_id 计算、分组缓存在“版本 × 样本”内共享且不跨样本复用）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”；修订审计覆盖创建/更新各写一条记录、记录与指针同事务（失败/过期/未知版本写入不留记录）、revision 序列连续无空洞、回滚追加新记录而不改写历史、按 revision 升序、`from_revision`/`limit` 过滤与翻页、多环境历史相互独立、并发竞争失败者不留记录、记录时间与指针 `updated_at` 一致；变更审批覆盖创建时全字段落库与各前置校验（环境不存在/过期 base_revision/未知目标版本/目标即当前指针/409 优先于 404/`required_approvals` 1–5 边界）、投票（不同审批人按序计票、重复投票拒绝且计数不变、申请人自批拒绝、已执行/已失效单拒绝投票、并发重复投票恰有一票成功）、执行（票数不足拒绝且指针不动、达标后移动指针并同事务追加审计、超出门槛的票数仍可执行、revision 已变化时标记 stale 且指针与历史不变、已执行/已失效单拒绝重复执行、多环境审批单相互独立）与详情查询（状态与票数回显）；另有 `tests/test_api_validation.py` 通过 FastAPI TestClient 做接口回归：重复 `subject_id` 返回 422 `invalid_request` 信封（而非 500）、`errors[]` 保留 `loc`/`type`/`msg`/`input` 且 `ctx` 异常被字符串化、普通字段错误（含 `ctx` 数值）、缺失/多余字段与非法 JSON 走同一处理器、版本不存在仍为 404、合法预演仍返回 200，历史接口的升序返回/404/查询参数过滤/失败写入不留记录/非法参数 422，以及审批接口的完整流程（创建→投票→执行→详情）、各类 404/409/422 错误信封与执行后指针/历史/状态的一致性。
 
 ## 项目结构
 
@@ -467,14 +506,14 @@ pip install httpx   # 仅测试需要；生产镜像只安装 requirements.txt
 app/
   main.py        FastAPI 路由与错误处理
   schemas.py     Pydantic v2 请求/响应模型（含 segments 与条件模型）
-  db.py          SQLite 不可变版本存储 + 环境指针（WAL、外键、BEGIN IMMEDIATE 乐观并发）+ 不可变修订审计表
+  db.py          SQLite 不可变版本存储 + 环境指针（WAL、外键、BEGIN IMMEDIATE 乐观并发）+ 不可变修订审计表 + 变更审批（审批单/投票）
   validation.py  发布时语义校验（循环依赖/比例/操作符/分组引用与分组循环）
   evaluator.py   纯函数判定引擎（前置、分组递归求值与请求内复用、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
   preview.py     评估预览：两版本 × 样本 × 开关的判定差异（纯函数，分组缓存不跨样本）
 tests/           标准库 unittest 测试（test_engine.py）+ FastAPI TestClient 接口回归（test_api_validation.py）
-examples/        发布/判定/受众分组/版本对比/评估预览/环境指针/非法配置示例
+examples/        发布/判定/受众分组/版本对比/评估预览/环境指针/变更审批/非法配置示例
 Dockerfile, docker-compose.yml
 ```
 
-> 升级到包含环境指针的版本时，服务启动会自动对已有的 `flags.db` 执行 `CREATE TABLE IF NOT EXISTS environments` 与 `CREATE TABLE IF NOT EXISTS environment_history`，卷中历史版本数据不受影响，无需手动迁移。升级前已存在的环境指针没有历史记录属正常——审计从升级后的第一次成功写入开始累积，`GET .../history` 会返回空列表（环境本身仍返回 200）。
+> 升级到包含环境指针的版本时，服务启动会自动对已有的 `flags.db` 执行 `CREATE TABLE IF NOT EXISTS environments`、`environment_history`、`change_approvals` 与 `approval_votes`，卷中历史版本数据不受影响，无需手动迁移。升级前已存在的环境指针没有历史记录属正常——审计从升级后的第一次成功写入开始累积，`GET .../history` 会返回空列表（环境本身仍返回 200）。

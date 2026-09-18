@@ -16,8 +16,11 @@ from .comparison import compare_versions
 from .evaluator import FlagEvaluator, FlagNotFound
 from .preview import build_evaluation_preview
 from .schemas import (
+    ApprovalVoteRequest,
     BatchEvalRequest,
     BatchEvalResponse,
+    ChangeApprovalCreateRequest,
+    ChangeApprovalResponse,
     ConfigComparisonRequest,
     ConfigComparisonResponse,
     ConfigResponse,
@@ -495,6 +498,163 @@ def evaluate_environment(name: str, body: EnvironmentEvalRequest) -> Any:
     )
 
 
+# ---------------------------------------------------------------------------
+# Change approvals (review-then-execute pointer moves)
+# ---------------------------------------------------------------------------
+
+
+def _approval_error(exc: Exception) -> HTTPException:
+    """Translate approval storage exceptions into the error envelope."""
+    if isinstance(exc, db_mod.EnvironmentNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={"code": "environment_not_found", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.VersionNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={"code": "version_not_found", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.ApprovalNotFound):
+        return HTTPException(
+            status_code=404,
+            detail={"code": "approval_not_found", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.StaleRevision):
+        detail: dict[str, Any] = {"code": "stale_revision", "message": str(exc)}
+        if exc.current is not None:
+            detail["current_revision"] = exc.current
+        return HTTPException(status_code=409, detail=detail)
+    if isinstance(exc, db_mod.NoChange):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "no_change", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.ApprovalNotPending):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "approval_closed",
+                "message": str(exc),
+                "status": exc.status,
+            },
+        )
+    if isinstance(exc, db_mod.SelfApproval):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "self_approval", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.DuplicateVote):
+        return HTTPException(
+            status_code=409,
+            detail={"code": "duplicate_vote", "message": str(exc)},
+        )
+    if isinstance(exc, db_mod.ApprovalsNotMet):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "approvals_not_met",
+                "message": str(exc),
+                "votes": exc.votes,
+                "required_approvals": exc.required,
+            },
+        )
+    raise exc  # pragma: no cover - defensive: all cases handled above
+
+
+@app.post(
+    "/api/v1/change-approvals",
+    response_model=ChangeApprovalResponse,
+    status_code=201,
+)
+def create_change_approval(body: ChangeApprovalCreateRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        try:
+            approval = db_mod.create_change_approval(
+                conn,
+                environment=body.environment,
+                target_version=body.target_version,
+                base_revision=body.base_revision,
+                applicant=body.applicant,
+                required_approvals=body.required_approvals,
+            )
+        except (
+            db_mod.EnvironmentNotFound,
+            db_mod.StaleRevision,
+            db_mod.VersionNotFound,
+            db_mod.NoChange,
+        ) as exc:
+            raise _approval_error(exc)
+    finally:
+        conn.close()
+    return ChangeApprovalResponse(**approval)
+
+
+@app.get(
+    "/api/v1/change-approvals/{approval_id}",
+    response_model=ChangeApprovalResponse,
+)
+def get_change_approval(approval_id: int) -> Any:
+    conn = db_mod.connect()
+    try:
+        approval = db_mod.get_change_approval(conn, approval_id)
+        if approval is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "approval_not_found",
+                    "message": f"change approval {approval_id} not found",
+                },
+            )
+    finally:
+        conn.close()
+    return ChangeApprovalResponse(**approval)
+
+
+@app.post(
+    "/api/v1/change-approvals/{approval_id}/votes",
+    response_model=ChangeApprovalResponse,
+    status_code=201,
+)
+def vote_change_approval(approval_id: int, body: ApprovalVoteRequest) -> Any:
+    conn = db_mod.connect()
+    try:
+        try:
+            approval = db_mod.add_approval_vote(conn, approval_id, body.approver)
+        except (
+            db_mod.ApprovalNotFound,
+            db_mod.ApprovalNotPending,
+            db_mod.SelfApproval,
+            db_mod.DuplicateVote,
+        ) as exc:
+            raise _approval_error(exc)
+    finally:
+        conn.close()
+    return ChangeApprovalResponse(**approval)
+
+
+@app.post(
+    "/api/v1/change-approvals/{approval_id}/execute",
+    response_model=ChangeApprovalResponse,
+)
+def execute_change_approval(approval_id: int) -> Any:
+    conn = db_mod.connect()
+    try:
+        try:
+            approval = db_mod.execute_change_approval(conn, approval_id)
+        except (
+            db_mod.ApprovalNotFound,
+            db_mod.ApprovalNotPending,
+            db_mod.ApprovalsNotMet,
+            db_mod.StaleRevision,
+        ) as exc:
+            raise _approval_error(exc)
+    finally:
+        conn.close()
+    return ChangeApprovalResponse(**approval)
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -511,6 +671,10 @@ def root() -> dict[str, Any]:
             "GET /api/v1/environments/{name}",
             "GET /api/v1/environments/{name}/history",
             "POST /api/v1/environments/{name}/evaluate",
+            "POST /api/v1/change-approvals",
+            "GET /api/v1/change-approvals/{id}",
+            "POST /api/v1/change-approvals/{id}/votes",
+            "POST /api/v1/change-approvals/{id}/execute",
             "POST /api/v1/evaluate",
         ],
     }
